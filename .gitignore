@@ -1,0 +1,7 @@
+venv_clean/ 
+__pycache__/ 
+*.pyc 
+.env 
+model/
+model_onnx/ 
+task_extractor_v3_flan_t5_small.zip 
