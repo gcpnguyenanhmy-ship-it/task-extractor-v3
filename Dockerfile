@@ -47,8 +47,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # build Docker image - không convert lúc runtime.
 # --------------------------------------------------------
 
-COPY app_onnx_manual.py .
-COPY model_onnx/ ./model_onnx/
+COPY app_onnx.py .
+COPY model_onnx_int8/ ./model_onnx_int8/
 
 # --------------------------------------------------------
 # Render cung cấp PORT qua biến môi trường $PORT
@@ -59,4 +59,4 @@ ENV PORT=8000
 
 EXPOSE 8000
 
-CMD uvicorn app_onnx_manual:app --host 0.0.0.0 --port ${PORT}
+CMD uvicorn app_onnx:app --host 0.0.0.0 --port ${PORT}
