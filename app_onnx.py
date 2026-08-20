@@ -1,5 +1,8 @@
 import os
 import json
+import re
+import time
+
 import numpy as np
 import onnxruntime as ort
 
@@ -15,8 +18,34 @@ from transformers import AutoTokenizer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "model_onnx_int8")
 
-ENCODER_PATH = os.path.join(MODEL_DIR, "encoder_model.onnx")
-DECODER_PATH = os.path.join(MODEL_DIR, "decoder_model.onnx")
+ENCODER_PATH = os.path.join(
+    MODEL_DIR,
+    "encoder_model.onnx"
+)
+
+DECODER_PATH = os.path.join(
+    MODEL_DIR,
+    "decoder_model.onnx"
+)
+
+# Render Free = CPU rất thấp
+# Không nên để ONNX tự tạo quá nhiều CPU threads.
+SESSION_OPTIONS = ort.SessionOptions()
+
+SESSION_OPTIONS.intra_op_num_threads = 1
+SESSION_OPTIONS.inter_op_num_threads = 1
+
+SESSION_OPTIONS.graph_optimization_level = (
+    ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+)
+
+PROVIDERS = ["CPUExecutionProvider"]
+
+# Giới hạn output để giảm số lần decoder.run()
+MAX_NEW_TOKENS = 48
+
+REPETITION_PENALTY = 1.05
+NO_REPEAT_NGRAM_SIZE = 3
 
 
 # ============================================================
@@ -38,24 +67,74 @@ if not os.path.exists(DECODER_PATH):
 # TOKENIZER
 # ============================================================
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_DIR
+)
 
 
 # ============================================================
 # ONNX SESSIONS
 # ============================================================
 
-providers = ["CPUExecutionProvider"]
+print("=" * 70)
+print("LOADING ONNX MODEL")
+print("=" * 70)
 
 encoder_session = ort.InferenceSession(
     ENCODER_PATH,
-    providers=providers
+    sess_options=SESSION_OPTIONS,
+    providers=PROVIDERS
 )
 
 decoder_session = ort.InferenceSession(
     DECODER_PATH,
-    providers=providers
+    sess_options=SESSION_OPTIONS,
+    providers=PROVIDERS
 )
+
+print("ONNX models loaded.")
+
+
+# ============================================================
+# CACHE MODEL METADATA
+# ============================================================
+
+ENCODER_INPUT_NAMES = [
+    x.name
+    for x in encoder_session.get_inputs()
+]
+
+ENCODER_OUTPUT_NAMES = [
+    x.name
+    for x in encoder_session.get_outputs()
+]
+
+DECODER_INPUT_NAMES = [
+    x.name
+    for x in decoder_session.get_inputs()
+]
+
+DECODER_OUTPUT_NAMES = [
+    x.name
+    for x in decoder_session.get_outputs()
+]
+
+
+# ============================================================
+# TOKEN IDS
+# ============================================================
+
+DECODER_START_TOKEN_ID = (
+    tokenizer.pad_token_id
+    if tokenizer.pad_token_id is not None
+    else tokenizer.eos_token_id
+)
+
+if DECODER_START_TOKEN_ID is None:
+    DECODER_START_TOKEN_ID = 0
+
+
+EOS_TOKEN_ID = tokenizer.eos_token_id
 
 
 # ============================================================
@@ -64,7 +143,7 @@ decoder_session = ort.InferenceSession(
 
 app = FastAPI(
     title="Task Extractor ONNX API",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 
@@ -74,18 +153,6 @@ app = FastAPI(
 
 class PredictRequest(BaseModel):
     text: str
-
-
-# ============================================================
-# HELPER
-# ============================================================
-
-def get_input_names(session):
-    return [x.name for x in session.get_inputs()]
-
-
-def get_output_names(session):
-    return [x.name for x in session.get_outputs()]
 
 
 # ============================================================
@@ -114,22 +181,16 @@ print("\nDecoder outputs:")
 for x in decoder_session.get_outputs():
     print(" ", x.name, x.shape, x.type)
 
+print("\nGeneration:")
+print(" MAX_NEW_TOKENS:", MAX_NEW_TOKENS)
+print(" intra_op_num_threads:", SESSION_OPTIONS.intra_op_num_threads)
+print(" inter_op_num_threads:", SESSION_OPTIONS.inter_op_num_threads)
+
 print("=" * 70)
 
 
 # ============================================================
 # PROMPT
-# ============================================================
-#
-# QUAN TRỌNG:
-#
-# Model được fine-tune để phản hồi đúng khi nhận PROMPT ĐẦY ĐỦ
-# (rules + format JSON yêu cầu), giống hệt lúc train.
-#
-# Nếu chỉ đưa text gốc vào thẳng tokenizer (thiếu bước này),
-# model sẽ không biết cần sinh JSON, dẫn đến việc nó chỉ
-# "copy" lại nguyên văn câu input.
-#
 # ============================================================
 
 def build_prompt(text):
@@ -155,42 +216,73 @@ def build_prompt(text):
 
 
 # ============================================================
+# JSON COMPLETION CHECK
+# ============================================================
+
+def looks_like_complete_json(text):
+
+    text = text.strip()
+
+    if not text:
+        return False
+
+    # Phải có cấu trúc cơ bản
+    if not text.startswith("{"):
+        return False
+
+    if '"tasks"' not in text:
+        return False
+
+    if '"title"' not in text:
+        return False
+
+    if '"notes"' not in text:
+        return False
+
+    # JSON hoàn chỉnh
+    try:
+        data = json.loads(text)
+
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("tasks"), list)
+            and len(data["tasks"]) > 0
+        ):
+            task = data["tasks"][0]
+
+            if (
+                isinstance(task, dict)
+                and str(task.get("title", "")).strip()
+                and str(task.get("notes", "")).strip()
+            ):
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+# ============================================================
 # GENERATION
 # ============================================================
 
 def generate_text(
     text,
-    max_new_tokens=128,
-    num_beams=1,
-    repetition_penalty=1.05,
-    no_repeat_ngram_size=3
+    max_new_tokens=MAX_NEW_TOKENS,
+    repetition_penalty=REPETITION_PENALTY,
+    no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE
 ):
-    """
-    Generate text using encoder_model.onnx + decoder_model.onnx.
 
-    This implementation is designed for the exported T5/FLAN-T5
-    ONNX structure in model_onnx.
-
-    ------------------------------------------------------------
-    QUAN TRỌNG - LỖI ĐÃ SỬA:
-
-    Decoder ONNX (export riêng, không dùng optimum wrapper)
-    đặt tên input token CỦA NÓ là "input_ids" - nhưng đây LÀ
-    chuỗi decoder_input_ids đang được sinh dần (bắt đầu từ
-    decoder_start_token_id), KHÔNG PHẢI input_ids của câu gốc
-    đưa vào encoder.
-
-    Bản cũ gán nhầm input_ids gốc vào decoder mỗi vòng lặp,
-    khiến decoder không bao giờ thấy chuỗi mình đang sinh ra
-    -> luôn dự đoán cùng 1 token -> output toàn dấu chấm lặp lại.
-    ------------------------------------------------------------
-    """
+    total_start = time.perf_counter()
 
     # --------------------------------------------------------
-    # TOKENIZE INPUT (ĐÃ BỌC PROMPT)
+    # TOKENIZE
     # --------------------------------------------------------
 
     prompt = build_prompt(text)
+
+    tokenize_start = time.perf_counter()
 
     encoded = tokenizer(
         prompt,
@@ -201,21 +293,22 @@ def generate_text(
     )
 
     input_ids = encoded["input_ids"].astype(np.int64)
-
     attention_mask = encoded["attention_mask"].astype(np.int64)
+
+    tokenize_time = time.perf_counter() - tokenize_start
 
     # --------------------------------------------------------
     # ENCODER
     # --------------------------------------------------------
 
+    encoder_start = time.perf_counter()
+
     encoder_inputs = {}
 
-    encoder_input_names = get_input_names(encoder_session)
-
-    if "input_ids" in encoder_input_names:
+    if "input_ids" in ENCODER_INPUT_NAMES:
         encoder_inputs["input_ids"] = input_ids
 
-    if "attention_mask" in encoder_input_names:
+    if "attention_mask" in ENCODER_INPUT_NAMES:
         encoder_inputs["attention_mask"] = attention_mask
 
     encoder_outputs = encoder_session.run(
@@ -223,37 +316,19 @@ def generate_text(
         encoder_inputs
     )
 
-    # First encoder output is normally last_hidden_state
     encoder_hidden_states = encoder_outputs[0]
 
-    # --------------------------------------------------------
-    # DECODER INPUT NAMES
-    # --------------------------------------------------------
-
-    decoder_input_names = get_input_names(decoder_session)
+    encoder_time = time.perf_counter() - encoder_start
 
     # --------------------------------------------------------
-    # START TOKEN
+    # DECODER
     # --------------------------------------------------------
 
-    decoder_start_token_id = (
-        tokenizer.pad_token_id
-        if tokenizer.pad_token_id is not None
-        else tokenizer.eos_token_id
-    )
-
-    if decoder_start_token_id is None:
-        decoder_start_token_id = 0
+    decoder_start = time.perf_counter()
 
     generated = [
-        decoder_start_token_id
+        DECODER_START_TOKEN_ID
     ]
-
-    # --------------------------------------------------------
-    # GREEDY DECODING
-    # --------------------------------------------------------
-
-    eos_token_id = tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
 
@@ -264,7 +339,7 @@ def generate_text(
 
         decoder_inputs = {}
 
-        for name in decoder_input_names:
+        for name in DECODER_INPUT_NAMES:
 
             if name in (
                 "decoder_input_ids",
@@ -281,22 +356,13 @@ def generate_text(
             elif name == "encoder_attention_mask":
                 decoder_inputs[name] = attention_mask
 
-            # FIX: "input_ids" của decoder graph = chuỗi đang
-            # sinh dần (decoder_input_ids), KHÔNG PHẢI input_ids
-            # của câu gốc.
             elif name == "input_ids":
                 decoder_inputs[name] = decoder_input_ids
 
-            # FIX: nếu decoder có input "attention_mask" riêng,
-            # đó là mask CỦA decoder_input_ids (toàn số 1 vì
-            # không có padding khi generate từng bước một),
-            # không phải attention_mask của câu gốc/encoder.
             elif name == "attention_mask":
-                decoder_inputs[name] = np.ones_like(decoder_input_ids)
-
-        # ----------------------------------------------------
-        # DECODER
-        # ----------------------------------------------------
+                decoder_inputs[name] = np.ones_like(
+                    decoder_input_ids
+                )
 
         outputs = decoder_session.run(
             None,
@@ -305,55 +371,95 @@ def generate_text(
 
         logits = outputs[0]
 
-        # Last generated position
-        next_token_logits = logits[:, -1, :].copy()
+        next_token_logits = (
+            logits[:, -1, :].copy()
+        )
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # REPETITION PENALTY
-        #
-        # Giảm xác suất các token ĐÃ xuất hiện trong `generated`,
-        # giống hệt tham số repetition_penalty trong
-        # transformers.generate() của bản torch gốc.
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
-        if repetition_penalty and repetition_penalty != 1.0:
+        if repetition_penalty != 1.0:
 
             for token_id in set(generated):
 
-                score = next_token_logits[0, token_id]
+                score = next_token_logits[
+                    0,
+                    token_id
+                ]
 
                 if score > 0:
-                    next_token_logits[0, token_id] = score / repetition_penalty
+
+                    next_token_logits[
+                        0,
+                        token_id
+                    ] = (
+                        score /
+                        repetition_penalty
+                    )
+
                 else:
-                    next_token_logits[0, token_id] = score * repetition_penalty
 
-        # --------------------------------------------------
+                    next_token_logits[
+                        0,
+                        token_id
+                    ] = (
+                        score *
+                        repetition_penalty
+                    )
+
+        # ----------------------------------------------------
         # NO REPEAT NGRAM
-        #
-        # Chặn hoàn toàn các token khiến n-gram cuối bị lặp lại
-        # (giống no_repeat_ngram_size trong bản torch gốc).
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
-        if no_repeat_ngram_size and len(generated) >= no_repeat_ngram_size:
+        if (
+            no_repeat_ngram_size
+            and
+            len(generated) >= no_repeat_ngram_size
+        ):
 
             n = no_repeat_ngram_size
 
             prev_ngrams = {}
 
-            for i in range(len(generated) - n + 1):
+            for i in range(
+                len(generated) - n + 1
+            ):
 
-                ngram = tuple(generated[i:i + n - 1])
-                next_tok = generated[i + n - 1]
+                ngram = tuple(
+                    generated[
+                        i:i + n - 1
+                    ]
+                )
 
-                prev_ngrams.setdefault(ngram, set()).add(next_tok)
+                next_tok = generated[
+                    i + n - 1
+                ]
 
-            current_prefix = tuple(generated[-(n - 1):])
+                prev_ngrams.setdefault(
+                    ngram,
+                    set()
+                ).add(next_tok)
 
-            banned_tokens = prev_ngrams.get(current_prefix, set())
+            current_prefix = tuple(
+                generated[-(n - 1):]
+            )
+
+            banned_tokens = prev_ngrams.get(
+                current_prefix,
+                set()
+            )
 
             for token_id in banned_tokens:
 
-                next_token_logits[0, token_id] = -1e9
+                next_token_logits[
+                    0,
+                    token_id
+                ] = -1e9
+
+        # ----------------------------------------------------
+        # GREEDY
+        # ----------------------------------------------------
 
         next_token_id = int(
             np.argmax(
@@ -362,18 +468,41 @@ def generate_text(
             )[0]
         )
 
-        generated.append(next_token_id)
+        generated.append(
+            next_token_id
+        )
 
         # ----------------------------------------------------
         # EOS
         # ----------------------------------------------------
 
-        if eos_token_id is not None:
-            if next_token_id == eos_token_id:
+        if (
+            EOS_TOKEN_ID is not None
+            and
+            next_token_id == EOS_TOKEN_ID
+        ):
+            break
+
+        # ----------------------------------------------------
+        # EARLY STOP
+        # ----------------------------------------------------
+
+        # Decode phần đang có để kiểm tra JSON.
+        # Chỉ kiểm tra khi output đã đủ dài.
+        if len(generated) >= 12:
+
+            partial = tokenizer.decode(
+                generated,
+                skip_special_tokens=True
+            )
+
+            if looks_like_complete_json(partial):
                 break
 
+    decoder_time = time.perf_counter() - decoder_start
+
     # --------------------------------------------------------
-    # DECODE
+    # DECODE FINAL
     # --------------------------------------------------------
 
     output_ids = np.array(
@@ -386,9 +515,282 @@ def generate_text(
         skip_special_tokens=True
     )
 
+    total_time = time.perf_counter() - total_start
+
+    print(
+        "[TIMING] "
+        f"tokenize={tokenize_time:.3f}s | "
+        f"encoder={encoder_time:.3f}s | "
+        f"decoder={decoder_time:.3f}s | "
+        f"total={total_time:.3f}s | "
+        f"tokens={len(generated)}"
+    )
+
     return result.strip()
 
 
+# ============================================================
+# JSON PARSER
+# ============================================================
+
+def parse_model_output(raw_output: str):
+
+    if raw_output is None:
+        raw_output = ""
+
+    raw = str(raw_output).strip()
+
+    raw = raw.replace("<pad>", "")
+    raw = raw.replace("</s>", "")
+    raw = raw.replace("<s>", "")
+
+    raw = raw.strip()
+
+    raw = (
+        raw
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+    # --------------------------------------------------------
+    # DIRECT JSON
+    # --------------------------------------------------------
+
+    try:
+
+        data = json.loads(raw)
+
+        if isinstance(data, dict):
+
+            tasks = data.get("tasks")
+
+            if (
+                isinstance(tasks, list)
+                and len(tasks) > 0
+            ):
+
+                first_task = tasks[0]
+
+                if isinstance(first_task, dict):
+
+                    title = str(
+                        first_task.get(
+                            "title",
+                            ""
+                        )
+                    ).strip()
+
+                    notes = str(
+                        first_task.get(
+                            "notes",
+                            ""
+                        )
+                    ).strip()
+
+                    if title and notes:
+
+                        return {
+                            "tasks": [
+                                {
+                                    "title": title,
+                                    "notes": notes
+                                }
+                            ]
+                        }
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # FALLBACK
+    # --------------------------------------------------------
+
+    title = ""
+
+    title_patterns = [
+        r'"title"\s*:\s*"([^"]+)"',
+        r'title\s*:\s*"([^"]+)"',
+    ]
+
+    for pattern in title_patterns:
+
+        match = re.search(
+            pattern,
+            raw,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            title = match.group(1).strip()
+
+            if title:
+                break
+
+    notes = ""
+
+    notes_match = re.search(
+        r'"notes"',
+        raw,
+        flags=re.IGNORECASE
+    )
+
+    if notes_match:
+
+        notes_part = raw[
+            notes_match.end():
+        ]
+
+        notes_part = re.sub(
+            r'^\s*:\s*',
+            '',
+            notes_part
+        )
+
+        notes_part = notes_part.lstrip(
+            ' \t\r\n:,"\''
+        )
+
+        notes_part = re.sub(
+            r'"\s*\]?\s*\}?\s*$',
+            '',
+            notes_part
+        )
+
+        notes_part = re.sub(
+            r'[,"\']+\s*$',
+            '',
+            notes_part
+        )
+
+        notes = notes_part.strip()
+
+    if not notes and title:
+        notes = title
+
+    if not title:
+        title = "Task"
+
+    if not notes:
+        notes = title
+
+    title = re.sub(
+        r'\s+',
+        ' ',
+        title.strip()
+    )
+
+    notes = re.sub(
+        r'\s+',
+        ' ',
+        notes.strip()
+    )
+
+    notes = notes.rstrip(
+        ']}'
+    ).strip()
+
+    # --------------------------------------------------------
+    # REMOVE DEADLINE FROM NOTES
+    # --------------------------------------------------------
+
+    deadline_patterns = [
+
+        r'\s+before\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b',
+
+        r'\s+by\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b',
+
+        r'\s+before\s+(?:today|tomorrow|tonight)\b',
+
+        r'\s+by\s+(?:today|tomorrow|tonight)\b',
+
+        r'\s+before\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b',
+
+        r'\s+by\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b',
+    ]
+
+    for pattern in deadline_patterns:
+
+        notes = re.sub(
+            pattern,
+            '',
+            notes,
+            flags=re.IGNORECASE
+        )
+
+    notes = notes.strip()
+
+    return {
+        "tasks": [
+            {
+                "title": title,
+                "notes": notes
+            }
+        ]
+    }
+
+
+# ============================================================
+# PREDICT
+# ============================================================
+
+@app.post("/predict")
+def predict(request: PredictRequest):
+
+    text = request.text.strip()
+
+    if not text:
+
+        return {
+            "tasks": [
+                {
+                    "title": "",
+                    "notes": ""
+                }
+            ]
+        }
+
+    try:
+
+        raw = generate_text(text)
+
+        result = parse_model_output(
+            raw
+        )
+
+        print("\n" + "-" * 70)
+        print("INPUT:", text)
+        print(
+            "RAW MODEL OUTPUT:",
+            raw
+        )
+        print(
+            "FINAL JSON:",
+            json.dumps(
+                result,
+                ensure_ascii=False
+            )
+        )
+        print("-" * 70)
+
+        return result
+
+    except Exception as e:
+
+        print(
+            "[ERROR]",
+            repr(e)
+        )
+        return {
+            "tasks": [
+                {
+                    "title": "Task",
+                    "notes": str(e)
+                }
+            ]
+        }
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -403,167 +805,7 @@ def root():
 
 
 # ============================================================
-# JSON PARSER
-# ============================================================
-#
-# Parse output thô của model thành {"tasks":[{"title","notes"}]}
-# — GIỮ NGUYÊN logic robust parser từ app.py gốc, để khớp với
-# format mà HuggingFaceService.gs bên Apps Script đang mong đợi.
-#
-# ============================================================
-
-def parse_model_output(raw_output: str):
-
-    import re as _re
-
-    if raw_output is None:
-        raw_output = ""
-
-    raw = str(raw_output).strip()
-
-    raw = raw.replace("<pad>", "")
-    raw = raw.replace("</s>", "")
-    raw = raw.replace("<s>", "")
-    raw = raw.strip()
-
-    raw = (
-        raw.replace("\u201c", '"')
-           .replace("\u201d", '"')
-           .replace("\u2018", "'")
-           .replace("\u2019", "'")
-    )
-
-    try:
-        data = json.loads(raw)
-
-        if isinstance(data, dict):
-            tasks = data.get("tasks")
-            if isinstance(tasks, list) and len(tasks) > 0:
-                first_task = tasks[0]
-                if isinstance(first_task, dict):
-                    title = str(first_task.get("title", "")).strip()
-                    notes = str(first_task.get("notes", "")).strip()
-                    if title and notes:
-                        return {"tasks": [{"title": title, "notes": notes}]}
-    except Exception:
-        pass
-
-    title = ""
-    title_patterns = [
-        r'"title"\s*:\s*"([^"]+)"',
-        r'"title"\s*"[^"]*"\s*:\s*"([^"]+)"',
-        r'title\s*:\s*"([^"]+)"',
-    ]
-    for pattern in title_patterns:
-        match = _re.search(pattern, raw, flags=_re.IGNORECASE)
-        if match:
-            title = match.group(1).strip()
-            if title:
-                break
-
-    notes = ""
-    notes_match = _re.search(r'"notes"', raw, flags=_re.IGNORECASE)
-    if notes_match:
-        notes_part = raw[notes_match.end():]
-        notes_part = _re.sub(
-            r'^\s*(?:[:\-]?\s*(?:Optimize|optimized|optimization)(?:\s+to)?)?\s*[:\-]?\s*',
-            '', notes_part, flags=_re.IGNORECASE
-        )
-        notes_part = notes_part.lstrip()
-
-        # FIX: bỏ TẤT CẢ ký tự rác ở đầu (dấu phẩy, ngoặc kép,
-        # hai chấm, khoảng trắng...) thay vì chỉ 1 dấu ngoặc kép
-        # như trước — vì model đôi khi sinh ra nhiều ký tự thừa
-        # liên tiếp, ví dụ: ,"Check the documentation.
-        notes_part = _re.sub(r'^[\s:,"\'\-]+', '', notes_part)
-
-        notes_part = notes_part.strip()
-
-        notes_part = _re.sub(r'"\s*\]?\s*\}?\s*$', '', notes_part)
-        notes_part = notes_part.strip()
-
-        # FIX: dọn luôn ký tự rác còn sót lại ở CUỐI chuỗi
-        notes_part = _re.sub(r'[,"\'\s]+$', '', notes_part)
-        notes_part = _re.sub(r'^Optimize\s+to\s+', '', notes_part, flags=_re.IGNORECASE)
-        notes_part = _re.sub(r'^Optimize\s+', '', notes_part, flags=_re.IGNORECASE)
-        notes = notes_part.strip()
-
-    if not notes and title:
-        notes = title
-
-    if not title:
-        fallback_match = _re.search(
-            r'"tasks"\s*[:\[]*\s*"?title"?\s*[:"]+\s*"([^"]+)"',
-            raw, flags=_re.IGNORECASE
-        )
-        if fallback_match:
-            title = fallback_match.group(1).strip()
-
-    if not title:
-        title = "Task"
-    if not notes:
-        notes = title
-
-    title = _re.sub(r'\s+', ' ', title.strip())
-    notes = _re.sub(r'\s+', ' ', notes.strip())
-    notes = notes.rstrip(']}').strip()
-
-    deadline_patterns = [
-        r'\s+before\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b',
-        r'\s+by\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM)\b',
-        r'\s+before\s+(?:today|tomorrow|tonight)\b',
-        r'\s+by\s+(?:today|tomorrow|tonight)\b',
-        r'\s+before\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b',
-        r'\s+by\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b',
-    ]
-    for pattern in deadline_patterns:
-        notes = _re.sub(pattern, '', notes, flags=_re.IGNORECASE)
-    notes = notes.strip()
-
-    return {"tasks": [{"title": title, "notes": notes}]}
-
-
-# ============================================================
-# PREDICT
-# ============================================================
-
-@app.post("/predict")
-def predict(request: PredictRequest):
-
-    text = request.text.strip()
-
-    if not text:
-        return {
-            "tasks": [
-                {"title": "", "notes": ""}
-            ]
-        }
-
-    try:
-
-        raw = generate_text(text)
-
-        result = parse_model_output(raw)
-
-        print("\n" + "-" * 70)
-        print("INPUT:", text)
-        print("RAW MODEL OUTPUT:", raw)
-        print("FINAL JSON:", json.dumps(result, ensure_ascii=False))
-        print("-" * 70)
-
-        return result
-
-    except Exception as e:
-
-        return {
-            "tasks": [
-                {"title": "Task", "notes": str(e)}
-            ]
-        }
-
-
-# ============================================================
-# MODEL INFO ENDPOINT
+# MODEL INFO
 # ============================================================
 
 @app.get("/model-info")
@@ -571,11 +813,14 @@ def model_info():
 
     return {
         "model_dir": MODEL_DIR,
-        "encoder": os.path.basename(ENCODER_PATH),
-        "decoder": os.path.basename(DECODER_PATH),
-        "providers": providers,
-        "encoder_inputs": get_input_names(encoder_session),
-        "encoder_outputs": get_output_names(encoder_session),
-        "decoder_inputs": get_input_names(decoder_session),
-        "decoder_outputs": get_output_names(decoder_session)
+        "encoder": os.path.basename( ENCODER_PATH ),
+        "decoder": os.path.basename( DECODER_PATH),
+        "providers": PROVIDERS,
+        "encoder_inputs":ENCODER_INPUT_NAMES,
+        "encoder_outputs":ENCODER_OUTPUT_NAMES,
+        "decoder_inputs":DECODER_INPUT_NAMES,
+        "decoder_outputs":DECODER_OUTPUT_NAMES,
+        "max_new_tokens":MAX_NEW_TOKENS,
+        "intra_op_num_threads":SESSION_OPTIONS.intra_op_num_threads,
+        "inter_op_num_threads":SESSION_OPTIONS.inter_op_num_threads
     }
