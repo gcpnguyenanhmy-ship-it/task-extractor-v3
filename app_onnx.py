@@ -2,13 +2,91 @@ import os
 import json
 import re
 import time
+import logging
 
 import numpy as np
 import onnxruntime as ort
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
 from transformers import AutoTokenizer
+
+
+# ============================================================
+# LOGGING CONFIG
+#
+# BẢO MẬT:
+# Mặc định KHÔNG log nội dung tin nhắn thật (INPUT / RAW MODEL
+# OUTPUT / FINAL JSON) ra Render logs — đây là dữ liệu nội bộ
+# nhạy cảm (công việc, tên người, deadline...).
+#
+# Chỉ bật xem chi tiết bằng cách set biến môi trường trên Render:
+#   DEBUG_LOG = true
+#
+# Khi bật, log cũng chỉ hiện preview rút gọn (không toàn văn).
+# ============================================================
+
+DEBUG_LOG = (
+    os.getenv("DEBUG_LOG", "false").lower() == "true"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+logger = logging.getLogger("task-extractor-onnx")
+
+
+def preview(text, max_len=40):
+    """
+    Rút gọn text để log an toàn — không lộ toàn bộ nội dung.
+    """
+
+    if not text:
+        return ""
+
+    text = str(text).replace("\n", " ").strip()
+
+    if len(text) <= max_len:
+        return text
+
+    return text[:max_len] + "…(" + str(len(text)) + " chars)"
+
+
+# ============================================================
+# API KEY AUTH
+#
+# BẢO MẬT:
+# /predict và /model-info trước đây không yêu cầu xác thực —
+# bất kỳ ai biết URL cũng gọi được, kể cả xem cấu trúc model
+# nội bộ qua /model-info. Thêm API key dùng chung (giống
+# RESULT_TOKEN bên Cloudflare Worker) để chỉ hệ thống của bạn
+# gọi được.
+#
+# Set biến môi trường trên Render:
+#   TASK_EXTRACTOR_API_KEY = <chuỗi bí mật dài, ngẫu nhiên>
+#
+# Nếu không set biến này, endpoint sẽ mở public như cũ (để không
+# làm gãy hệ thống nếu bạn chưa kịp cấu hình) — NÊN set trong
+# production.
+# ============================================================
+
+API_KEY = os.getenv("TASK_EXTRACTOR_API_KEY", "")
+
+
+def verify_api_key(x_api_key: str = Header(default="")):
+
+    if not API_KEY:
+        # Chưa cấu hình key → không chặn (giữ hành vi cũ).
+        return
+
+    if x_api_key != API_KEY:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
 
 # ============================================================
@@ -76,9 +154,9 @@ tokenizer = AutoTokenizer.from_pretrained(
 # ONNX SESSIONS
 # ============================================================
 
-print("=" * 70)
-print("LOADING ONNX MODEL")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("LOADING ONNX MODEL")
+logger.info("=" * 70)
 
 encoder_session = ort.InferenceSession(
     ENCODER_PATH,
@@ -92,7 +170,7 @@ decoder_session = ort.InferenceSession(
     providers=PROVIDERS
 )
 
-print("ONNX models loaded.")
+logger.info("ONNX models loaded.")
 
 
 # ============================================================
@@ -156,37 +234,34 @@ class PredictRequest(BaseModel):
 
 
 # ============================================================
-# MODEL INFO
+# MODEL INFO (LOG NỘI BỘ LÚC KHỞI ĐỘNG)
+#
+# In ra log lúc start service để bạn tự kiểm tra — không phải
+# endpoint public, nên không cần che ở đây.
 # ============================================================
 
-print("=" * 70)
-print("TASK EXTRACTOR ONNX")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("TASK EXTRACTOR ONNX")
+logger.info("=" * 70)
 
-print("Model directory:", MODEL_DIR)
+logger.info("Model directory: %s", MODEL_DIR)
 
-print("\nEncoder inputs:")
-for x in encoder_session.get_inputs():
-    print(" ", x.name, x.shape, x.type)
+logger.info("Encoder inputs: %s", ENCODER_INPUT_NAMES)
+logger.info("Encoder outputs: %s", ENCODER_OUTPUT_NAMES)
+logger.info("Decoder inputs: %s", DECODER_INPUT_NAMES)
+logger.info("Decoder outputs: %s", DECODER_OUTPUT_NAMES)
 
-print("\nEncoder outputs:")
-for x in encoder_session.get_outputs():
-    print(" ", x.name, x.shape, x.type)
+logger.info("MAX_NEW_TOKENS: %s", MAX_NEW_TOKENS)
+logger.info("intra_op_num_threads: %s", SESSION_OPTIONS.intra_op_num_threads)
+logger.info("inter_op_num_threads: %s", SESSION_OPTIONS.inter_op_num_threads)
 
-print("\nDecoder inputs:")
-for x in decoder_session.get_inputs():
-    print(" ", x.name, x.shape, x.type)
+logger.info(
+    "DEBUG_LOG=%s | API key protection=%s",
+    DEBUG_LOG,
+    "ENABLED" if API_KEY else "DISABLED (no TASK_EXTRACTOR_API_KEY set)"
+)
 
-print("\nDecoder outputs:")
-for x in decoder_session.get_outputs():
-    print(" ", x.name, x.shape, x.type)
-
-print("\nGeneration:")
-print(" MAX_NEW_TOKENS:", MAX_NEW_TOKENS)
-print(" intra_op_num_threads:", SESSION_OPTIONS.intra_op_num_threads)
-print(" inter_op_num_threads:", SESSION_OPTIONS.inter_op_num_threads)
-
-print("=" * 70)
+logger.info("=" * 70)
 
 
 # ============================================================
@@ -517,13 +592,21 @@ def generate_text(
 
     total_time = time.perf_counter() - total_start
 
-    print(
-        "[TIMING] "
-        f"tokenize={tokenize_time:.3f}s | "
-        f"encoder={encoder_time:.3f}s | "
-        f"decoder={decoder_time:.3f}s | "
-        f"total={total_time:.3f}s | "
-        f"tokens={len(generated)}"
+    # --------------------------------------------------------
+    # TIMING LOG
+    #
+    # Chỉ số hiệu năng thuần (thời gian, số token) — không phải
+    # nội dung nhạy cảm, giữ log bình thường không cần che.
+    # --------------------------------------------------------
+
+    logger.info(
+        "[TIMING] tokenize=%.3fs | encoder=%.3fs | decoder=%.3fs | "
+        "total=%.3fs | tokens=%d",
+        tokenize_time,
+        encoder_time,
+        decoder_time,
+        total_time,
+        len(generated)
     )
 
     return result.strip()
@@ -734,10 +817,19 @@ def parse_model_output(raw_output: str):
 
 # ============================================================
 # PREDICT
+#
+# BẢO MẬT:
+# - Yêu cầu header "x-api-key" khớp TASK_EXTRACTOR_API_KEY
+#   (nếu biến này đã được set trên Render).
+# - KHÔNG log toàn văn text/raw output ra console theo mặc định.
+#   Chỉ log khi DEBUG_LOG=true, và chỉ log bản preview rút gọn.
 # ============================================================
 
 @app.post("/predict")
-def predict(request: PredictRequest):
+def predict(
+    request: PredictRequest,
+    _auth=Depends(verify_api_key)
+):
 
     text = request.text.strip()
 
@@ -760,37 +852,43 @@ def predict(request: PredictRequest):
             raw
         )
 
-        print("\n" + "-" * 70)
-        print("INPUT:", text)
-        print(
-            "RAW MODEL OUTPUT:",
-            raw
-        )
-        print(
-            "FINAL JSON:",
-            json.dumps(
-                result,
-                ensure_ascii=False
+        if DEBUG_LOG:
+
+            logger.info("-" * 70)
+            logger.info("INPUT: %s", preview(text))
+            logger.info("RAW MODEL OUTPUT: %s", preview(raw, max_len=80))
+            logger.info(
+                "FINAL JSON keys: tasks=%d",
+                len(result.get("tasks", []))
             )
-        )
-        print("-" * 70)
+            logger.info("-" * 70)
+
+        else:
+
+            logger.info(
+                "Predict request handled. input_len=%d tasks=%d",
+                len(text),
+                len(result.get("tasks", []))
+            )
 
         return result
 
     except Exception as e:
 
-        print(
-            "[ERROR]",
-            repr(e)
-        )
+        # Lỗi hệ thống — log lại để debug, nhưng không lộ nội
+        # dung tin nhắn gốc trong thông báo trả về cho client.
+        logger.error("[ERROR] %s", repr(e))
+
         return {
             "tasks": [
                 {
                     "title": "Task",
-                    "notes": str(e)
+                    "notes": "Internal error while processing request."
                 }
             ]
         }
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -806,21 +904,27 @@ def root():
 
 # ============================================================
 # MODEL INFO
+#
+# BẢO MẬT:
+# Endpoint này lộ cấu trúc nội bộ model (tên input/output,
+# đường dẫn). Yêu cầu cùng API key với /predict.
 # ============================================================
 
 @app.get("/model-info")
-def model_info():
+def model_info(
+    _auth=Depends(verify_api_key)
+):
 
     return {
         "model_dir": MODEL_DIR,
-        "encoder": os.path.basename( ENCODER_PATH ),
-        "decoder": os.path.basename( DECODER_PATH),
+        "encoder": os.path.basename(ENCODER_PATH),
+        "decoder": os.path.basename(DECODER_PATH),
         "providers": PROVIDERS,
-        "encoder_inputs":ENCODER_INPUT_NAMES,
-        "encoder_outputs":ENCODER_OUTPUT_NAMES,
-        "decoder_inputs":DECODER_INPUT_NAMES,
-        "decoder_outputs":DECODER_OUTPUT_NAMES,
-        "max_new_tokens":MAX_NEW_TOKENS,
-        "intra_op_num_threads":SESSION_OPTIONS.intra_op_num_threads,
-        "inter_op_num_threads":SESSION_OPTIONS.inter_op_num_threads
+        "encoder_inputs": ENCODER_INPUT_NAMES,
+        "encoder_outputs": ENCODER_OUTPUT_NAMES,
+        "decoder_inputs": DECODER_INPUT_NAMES,
+        "decoder_outputs": DECODER_OUTPUT_NAMES,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "intra_op_num_threads": SESSION_OPTIONS.intra_op_num_threads,
+        "inter_op_num_threads": SESSION_OPTIONS.inter_op_num_threads
     }

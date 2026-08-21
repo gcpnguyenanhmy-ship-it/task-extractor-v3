@@ -3,16 +3,92 @@ import re
 import json
 import zipfile
 import shutil
+import logging
 
 import torch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
 
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM
 )
+
+
+# ============================================================
+# LOGGING CONFIG
+#
+# BẢO MẬT:
+# Mặc định KHÔNG log nội dung tin nhắn thật (INPUT / RAW MODEL
+# OUTPUT / FINAL JSON) ra Render logs, vì đây là dữ liệu nội bộ
+# nhạy cảm (công việc, tên người, deadline...).
+#
+# Chỉ bật xem chi tiết bằng cách set biến môi trường trên Render:
+#   DEBUG_LOG = true
+#
+# Khi bật, log cũng chỉ hiện preview rút gọn (không toàn văn).
+# ============================================================
+
+DEBUG_LOG = (
+    os.getenv("DEBUG_LOG", "false").lower() == "true"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+logger = logging.getLogger("task-extractor")
+
+
+def preview(text, max_len=40):
+    """
+    Rút gọn text để log an toàn — không lộ toàn bộ nội dung.
+    """
+
+    if not text:
+        return ""
+
+    text = str(text).replace("\n", " ").strip()
+
+    if len(text) <= max_len:
+        return text
+
+    return text[:max_len] + "…(" + str(len(text)) + " chars)"
+
+
+# ============================================================
+# API KEY AUTH
+#
+# BẢO MẬT:
+# /predict trước đây không yêu cầu xác thực — bất kỳ ai biết URL
+# cũng gọi được. Thêm API key dùng chung (giống RESULT_TOKEN bên
+# Cloudflare Worker) để chỉ hệ thống của bạn gọi được.
+#
+# Set biến môi trường trên Render:
+#   TASK_EXTRACTOR_API_KEY = <chuỗi bí mật dài, ngẫu nhiên>
+#
+# Nếu không set biến này, endpoint sẽ mở public như cũ (để không
+# làm gãy hệ thống nếu bạn chưa kịp cấu hình) — NÊN set trong
+# production.
+# ============================================================
+
+API_KEY = os.getenv("TASK_EXTRACTOR_API_KEY", "")
+
+
+def verify_api_key(x_api_key: str = Header(default="")):
+
+    if not API_KEY:
+        # Chưa cấu hình key → không chặn (giữ hành vi cũ).
+        return
+
+    if x_api_key != API_KEY:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
 
 # ============================================================
@@ -47,22 +123,25 @@ DEVICE = (
 # HEADER
 # ============================================================
 
-print("=" * 70)
-print("TASK EXTRACTOR V3 API")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("TASK EXTRACTOR V3 API")
+logger.info("=" * 70)
 
-print("Base directory:")
-print(BASE_DIR)
-
-print("\nDevice:")
-print(DEVICE)
+logger.info("Base directory: %s", BASE_DIR)
+logger.info("Device: %s", DEVICE)
 
 if torch.cuda.is_available():
 
-    print(
-        "GPU:",
+    logger.info(
+        "GPU: %s",
         torch.cuda.get_device_name(0)
     )
+
+logger.info(
+    "DEBUG_LOG=%s | API key protection=%s",
+    DEBUG_LOG,
+    "ENABLED" if API_KEY else "DISABLED (no TASK_EXTRACTOR_API_KEY set)"
+)
 
 
 # ============================================================
@@ -82,9 +161,9 @@ if not os.path.exists(ZIP_FILE):
 # EXTRACT MODEL
 # ============================================================
 
-print("\n" + "=" * 70)
-print("CHECK MODEL")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("CHECK MODEL")
+logger.info("=" * 70)
 
 
 def find_config(directory):
@@ -114,7 +193,7 @@ config_file = find_config(
 
 if config_file is None:
 
-    print("\nExtracting model ZIP...")
+    logger.info("Extracting model ZIP...")
 
     if os.path.exists(
         MODEL_EXTRACT_DIR
@@ -138,22 +217,20 @@ if config_file is None:
             MODEL_EXTRACT_DIR
         )
 
-    print("Extract complete.")
+    logger.info("Extract complete.")
 
 else:
 
-    print(
-        "Model already extracted."
-    )
+    logger.info("Model already extracted.")
 
 
 # ============================================================
 # FIND REAL MODEL DIRECTORY
 # ============================================================
 
-print("\n" + "=" * 70)
-print("FIND MODEL DIRECTORY")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("FIND MODEL DIRECTORY")
+logger.info("=" * 70)
 
 
 def find_model_directory(root):
@@ -191,7 +268,7 @@ MODEL_DIR = find_model_directory(
 
 if MODEL_DIR is None:
 
-    print("\nFiles found in ZIP:")
+    logger.error("Files found in ZIP:")
 
     for root, dirs, files in os.walk(
         MODEL_EXTRACT_DIR
@@ -199,7 +276,7 @@ if MODEL_DIR is None:
 
         for file in files:
 
-            print(
+            logger.error(
                 os.path.join(
                     root,
                     file
@@ -212,22 +289,16 @@ if MODEL_DIR is None:
     )
 
 
-print(
-    "\nModel directory:"
-)
-
-print(
-    MODEL_DIR
-)
+logger.info("Model directory: %s", MODEL_DIR)
 
 
 # ============================================================
 # LOAD TOKENIZER
 # ============================================================
 
-print("\n" + "=" * 70)
-print("LOADING TOKENIZER")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("LOADING TOKENIZER")
+logger.info("=" * 70)
 
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -236,18 +307,16 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 
-print(
-    "Tokenizer loaded."
-)
+logger.info("Tokenizer loaded.")
 
 
 # ============================================================
 # LOAD MODEL
 # ============================================================
 
-print("\n" + "=" * 70)
-print("LOADING MODEL")
-print("=" * 70)
+logger.info("=" * 70)
+logger.info("LOADING MODEL")
+logger.info("=" * 70)
 
 
 model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -263,14 +332,8 @@ model.to(
 model.eval()
 
 
-print(
-    "Model loaded successfully."
-)
-
-print(
-    "Device:",
-    DEVICE
-)
+logger.info("Model loaded successfully.")
+logger.info("Device: %s", DEVICE)
 
 
 # ============================================================
@@ -765,11 +828,18 @@ def health():
 
 # ============================================================
 # PREDICT
+#
+# BẢO MẬT:
+# - Yêu cầu header "x-api-key" khớp TASK_EXTRACTOR_API_KEY
+#   (nếu biến này đã được set trên Render).
+# - KHÔNG log toàn văn text/raw output ra console theo mặc định.
+#   Chỉ log khi DEBUG_LOG=true, và chỉ log bản preview rút gọn.
 # ============================================================
 
 @app.post("/predict")
 def predict(
-    request: TaskRequest
+    request: TaskRequest,
+    _auth=Depends(verify_api_key)
 ):
 
     text = request.text.strip()
@@ -792,23 +862,24 @@ def predict(
     )
 
 
-    print("\n" + "-" * 70)
+    if DEBUG_LOG:
 
-    print("INPUT:")
-    print(text)
-
-    print("\nRAW MODEL OUTPUT:")
-    print(raw)
-
-    print("\nFINAL JSON:")
-    print(
-        json.dumps(
-            result,
-            ensure_ascii=False
+        logger.info("-" * 70)
+        logger.info("INPUT: %s", preview(text))
+        logger.info("RAW MODEL OUTPUT: %s", preview(raw, max_len=80))
+        logger.info(
+            "FINAL JSON keys: tasks=%d",
+            len(result.get("tasks", []))
         )
-    )
+        logger.info("-" * 70)
 
-    print("-" * 70)
+    else:
+
+        logger.info(
+            "Predict request handled. input_len=%d tasks=%d",
+            len(text),
+            len(result.get("tasks", []))
+        )
 
 
     return result
