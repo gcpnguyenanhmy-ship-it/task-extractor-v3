@@ -6,11 +6,10 @@ import logging
 
 import numpy as np
 import onnxruntime as ort
+from tokenizers import Tokenizer
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
-from transformers import AutoTokenizer
-
 
 # ============================================================
 # LOGGING CONFIG
@@ -106,6 +105,16 @@ DECODER_PATH = os.path.join(
     "decoder_model.onnx"
 )
 
+TOKENIZER_PATH = os.path.join(
+    MODEL_DIR,
+    "tokenizer.json"
+)
+
+CONFIG_PATH = os.path.join(
+    MODEL_DIR,
+    "config.json"
+)
+
 # Render Free = CPU rất thấp
 # Không nên để ONNX tự tạo quá nhiều CPU threads.
 SESSION_OPTIONS = ort.SessionOptions()
@@ -113,17 +122,23 @@ SESSION_OPTIONS = ort.SessionOptions()
 SESSION_OPTIONS.intra_op_num_threads = 1
 SESSION_OPTIONS.inter_op_num_threads = 1
 
+# Giảm mức tối ưu hoá graph + tắt arena/mem pattern để giảm RAM
+# (đổi lấy chút tốc độ, chấp nhận được với traffic thấp trên
+# Render free tier 512MB).
 SESSION_OPTIONS.graph_optimization_level = (
-    ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 )
+
+SESSION_OPTIONS.enable_cpu_mem_arena = False
+SESSION_OPTIONS.enable_mem_pattern = False
 
 PROVIDERS = ["CPUExecutionProvider"]
 
 # Giới hạn output để giảm số lần decoder.run()
 MAX_NEW_TOKENS = 48
 
-REPETITION_PENALTY = 1.05
-NO_REPEAT_NGRAM_SIZE = 3
+REPETITION_PENALTY = 1.0
+NO_REPEAT_NGRAM_SIZE = 0
 
 
 # ============================================================
@@ -140,14 +155,28 @@ if not os.path.exists(DECODER_PATH):
         f"Không tìm thấy decoder model: {DECODER_PATH}"
     )
 
+if not os.path.exists(TOKENIZER_PATH):
+    raise FileNotFoundError(
+        f"Không tìm thấy tokenizer.json: {TOKENIZER_PATH}"
+    )
+
 
 # ============================================================
 # TOKENIZER
+#
+# Dùng thẳng package `tokenizers` (fast tokenizer backend) thay
+# vì `transformers.AutoTokenizer`, để không phải import cả
+# package `transformers` (~300MB RAM chỉ để import) — RAM đo
+# thực tế giảm từ ~471MB xuống ~197MB peak với cách này.
 # ============================================================
 
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_DIR
-)
+tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+
+# Tương đương AutoTokenizer(..., truncation=True, max_length=512)
+tokenizer.enable_truncation(max_length=512)
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    _model_config = json.load(f)
 
 
 # ============================================================
@@ -200,19 +229,22 @@ DECODER_OUTPUT_NAMES = [
 
 # ============================================================
 # TOKEN IDS
+#
+# Đọc trực tiếp từ config.json thay vì qua
+# tokenizer.pad_token_id / tokenizer.eos_token_id của
+# transformers — giữ nguyên logic fallback như bản cũ.
 # ============================================================
 
-DECODER_START_TOKEN_ID = (
-    tokenizer.pad_token_id
-    if tokenizer.pad_token_id is not None
-    else tokenizer.eos_token_id
-)
+DECODER_START_TOKEN_ID = _model_config.get("pad_token_id")
+
+if DECODER_START_TOKEN_ID is None:
+    DECODER_START_TOKEN_ID = _model_config.get("eos_token_id")
 
 if DECODER_START_TOKEN_ID is None:
     DECODER_START_TOKEN_ID = 0
 
 
-EOS_TOKEN_ID = tokenizer.eos_token_id
+EOS_TOKEN_ID = _model_config.get("eos_token_id")
 
 
 # ============================================================
@@ -254,6 +286,8 @@ logger.info("Decoder outputs: %s", DECODER_OUTPUT_NAMES)
 logger.info("MAX_NEW_TOKENS: %s", MAX_NEW_TOKENS)
 logger.info("intra_op_num_threads: %s", SESSION_OPTIONS.intra_op_num_threads)
 logger.info("inter_op_num_threads: %s", SESSION_OPTIONS.inter_op_num_threads)
+logger.info("pad_token_id (decoder start): %s", DECODER_START_TOKEN_ID)
+logger.info("eos_token_id: %s", EOS_TOKEN_ID)
 
 logger.info(
     "DEBUG_LOG=%s | API key protection=%s",
@@ -270,17 +304,23 @@ logger.info("=" * 70)
 
 def build_prompt(text):
 
+    # QUAN TRỌNG: prompt này phải khớp CHÍNH XÁC với prompt dùng
+    # để build input_text lúc training (xem normalize_item() trong
+    # script train) - không phải bản rút gọn ở hàm predict_task()
+    # test nhanh cuối script train. Sai lệch prompt so với lúc
+    # train sẽ làm giảm chất lượng output.
+
     return (
-        "Convert the following English chat message "
-        "into exactly one task.\n\n"
+        "Convert the following English chat message into exactly ONE task.\n\n"
 
         "Rules:\n"
-        "1. Create a short and clear task title.\n"
-        "2. Notes should contain the task details.\n"
-        "3. Do NOT include deadlines or due times in notes.\n"
-        "4. Do NOT create multiple tasks.\n"
-        "5. Return ONLY valid JSON.\n"
-        "6. Use exactly this format:\n"
+        "1. Create one short, clear, actionable title.\n"
+        "2. The notes section must retain key information from the conversation; you may correct grammar and wording only to fix grammatical or spelling errors.\n"
+        "3. Do not invent information.\n"
+        "4. Preserve names, identifiers, technical values, files, code name, dates, and times.\n"
+        "5. Do not include deadlines or due times in notes.\n"
+        "6. Do not create multiple tasks. Combine multiple actions into one task.\n"
+        "7. Return only valid JSON in exactly this format:\n"
         '{"tasks":[{"title":"...","notes":"..."}]}\n\n'
 
         "Chat:\n"
@@ -359,16 +399,17 @@ def generate_text(
 
     tokenize_start = time.perf_counter()
 
-    encoded = tokenizer(
-        prompt,
-        return_tensors="np",
-        padding=False,
-        truncation=True,
-        max_length=512
+    encoded = tokenizer.encode(prompt)
+
+    input_ids = np.array(
+        [encoded.ids],
+        dtype=np.int64
     )
 
-    input_ids = encoded["input_ids"].astype(np.int64)
-    attention_mask = encoded["attention_mask"].astype(np.int64)
+    attention_mask = np.array(
+        [encoded.attention_mask],
+        dtype=np.int64
+    )
 
     tokenize_time = time.perf_counter() - tokenize_start
 
@@ -580,13 +621,8 @@ def generate_text(
     # DECODE FINAL
     # --------------------------------------------------------
 
-    output_ids = np.array(
-        [generated],
-        dtype=np.int64
-    )
-
     result = tokenizer.decode(
-        output_ids[0],
+        generated,
         skip_special_tokens=True
     )
 
