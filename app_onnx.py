@@ -315,12 +315,17 @@ def build_prompt(text):
 
         "Rules:\n"
         "1. Create one short, clear, actionable title.\n"
-        "2. The notes section must retain key information from the conversation; you may correct grammar and wording only to fix grammatical or spelling errors.\n"
+        "2. Notes must preserve the important information from the chat.\n"
         "3. Do not invent information.\n"
-        "4. Preserve names, identifiers, technical values, files, code name, dates, and times.\n"
+        "4. Preserve all names, identifiers, codes, and numbers exactly as "
+        "written, in whatever position they appear in the sentence. Never "
+        "drop or reposition them.\n"
         "5. Do not include deadlines or due times in notes.\n"
         "6. Do not create multiple tasks. Combine multiple actions into one task.\n"
-        "7. Return only valid JSON in exactly this format:\n"
+        "7. You may fix spelling and grammar mistakes only. Do NOT change the "
+        "action verb, do NOT paraphrase, and do NOT replace any word with a "
+        "synonym.\n"
+        "8. Return only valid JSON in exactly this format:\n"
         '{"tasks":[{"title":"...","notes":"..."}]}\n\n'
 
         "Chat:\n"
