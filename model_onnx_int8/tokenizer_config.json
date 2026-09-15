@@ -932,7 +932,7 @@
   "eos_token": "</s>",
   "extra_ids": 100,
   "extra_special_tokens": {},
-  "max_length": 96,
+  "max_length": 128,
   "model_max_length": 512,
   "pad_token": "<pad>",
   "sp_model_kwargs": {},
